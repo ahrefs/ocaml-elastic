@@ -1,0 +1,377 @@
+type basic_json <ocaml module="Atd_util.Yojson.Basic" t="t"> = abstract
+
+type safe_json <ocaml module="Atd_util.Yojson.Safe" t="t"> = abstract
+
+type unit_hit = {
+  index <json name="_index"> : string;
+  typ <json name="_type"> : string;
+  id <json name="_id"> : string;
+  ~routing <json name="_routing"> : string nullable;
+  ~found: bool;
+  ~score <json name="_score"> : float;
+  ?version <json name="_version"> : int option;
+  ?fields : (string * safe_json list) list <json repr="object"> option;
+  ?shard <json name="_shard"> : string option;
+  ?node <json name="_node"> : string option;
+  ~sort : safe_json list;
+}
+
+type nested_field = {
+  field : string;
+  offset : int;
+}
+
+type nested_unit_hit = {
+  fields <json name="_nested"> : nested_field;
+  ~score <json name="_score"> : float;
+  ~sort : safe_json list;
+}
+
+type 'a nested_hit = {
+  inherit nested_unit_hit;
+  source <json name="_source"> : 'a;
+}
+
+(* type of a "hit" object (third level json data returned by ES,
+   containing the document in the _source field. *)
+type ('a) hit = {
+  inherit unit_hit;
+  source <json name="_source"> : 'a;
+}
+
+(* type of the "hits" object (second level json data returned by ES) *)
+type 'a hits' = {
+  total : int;
+  ~max_score : float;
+  hits : 'a; (* need to derive scroll_hit with concrete type for hits *)
+}
+
+type 'a hits = 'a list hits'
+
+type 'a option_hit = {
+  inherit unit_hit;
+  ?source <json name="_source"> : 'a option;
+}
+
+type multiget_item = {
+  id <json name="_id"> : string;
+  ?typ <json name="_type"> : string option;
+  ?index <json name="_index"> : string option;
+  ?routing <json name="_routing"> : string option;
+}
+
+(* type of ES multiget query *)
+type multiget = {
+  docs : multiget_item list;
+}
+
+(* type of the "docs" object returned by multi get *)
+type 'a multiget_response = {
+  docs : 'a option_hit list;
+}
+
+(* type of an ES response (toplevel json data returned by ES) *)
+type 'a base_response = {
+  took: int;
+  timed_out: bool;
+  shards <json name="_shards"> : shards_stats;
+  ?scroll_id <json name="_scroll_id"> : string option;
+  ?error : error option;
+  ?hits: 'a hits option;
+}
+
+type 'a response = 'a hit base_response
+
+type unit_response = unit_hit base_response
+
+type 'a opt_response = 'a option_hit base_response
+
+type ('a, 'b) aggs_response = {
+  inherit 'a response;
+  aggregations : 'b;
+}
+
+type ('a, 'b) opt_aggs_response = {
+  inherit 'a response;
+  ?aggregations : 'b option;
+}
+
+type terms_bucket = {
+  key : string;
+  count <json name="doc_count"> : int;
+}
+
+type terms_agg = {
+  buckets : terms_bucket list;
+}
+
+type 'a bucket_agg = {
+  buckets : 'a;
+}
+
+type 'a value_agg = {
+  value : 'a;
+}
+
+type 'a hits_agg' = {
+  hits : 'a hits';
+}
+
+type 'a hits_agg = {
+  hits : 'a hits;
+}
+
+type doc_count = {
+  doc_count : int;
+}
+
+type index = {
+  index <json name="_index"> : string;
+  doc_type <json name="_type"> : string;
+  ?id <json name="_id"> : string option;
+  ?routing : string option;
+  ?version_type <json name="_version_type">: string option;
+  ?version <json name="_version">: int option;
+  ?parent : string option;
+}
+
+type index_command = (string * index) list <json repr="object">
+
+type error = {
+  error <json name="type"> : string;
+  ?reason : string nullable;
+}
+
+type global_error = {
+  error : global_error_data;
+}
+
+type global_error_data = {
+  root_cause : error list;
+}
+
+type bulk_index_result = {
+  index <json name="_index"> : string;
+  doc_type <json name="_type"> : string;
+  id <json name="_id"> : string;
+  ?version <json name="_version"> : int option;
+  status : int;
+  ?error : error option;
+}
+
+type bulk_result_item = (string * bulk_index_result) list <json repr="object">
+
+type bulk_result = {
+  took : int;
+  errors : bool;
+  ~items : bulk_result_item list;
+}
+
+type shards_stats = {
+  total : int;
+  successful : int;
+  failed : int;
+}
+
+type docs_stats = {
+  count : int;
+  deleted : int;
+}
+
+type index_stats_item = {
+  docs : docs_stats;
+}
+
+type index_stats = {
+  primaries : index_stats_item;
+  total : index_stats_item;
+}
+
+type stats = {
+  shards <json name="_shards"> : shards_stats;
+  all <json name="_all"> : index_stats;
+  indices : (string * index_stats) list <json repr="object">;
+}
+
+type index_result = {
+  index <json name="_index"> : string;
+  doc_type <json name="_type"> : string;
+  id <json name="_id"> : string;
+  ?version <json name="_version"> : int option;
+  result : string;
+  ?shards <json name="_shards"> : shards_stats option;
+}
+
+type search_stats = {
+  ?error : error option;
+  ?shards <json name="_shards"> : shards_stats option;
+}
+
+type shard_data = {
+  state : string;
+  primary : bool;
+  node : string;
+  ?relocating_node : string nullable;
+  shard : int;
+  index : string;
+}
+
+type node_data = {
+  name : string;
+  address <json name="transport_address"> : string;
+}
+
+type search_shards = {
+  ?error : error option;
+  ~shards : shard_data list list;
+  ~indices : (string * safe_json) list <json repr="object">;
+  ~nodes : (string * node_data) list <json repr="object">;
+}
+
+type ('a) scroll_hits_generic = {
+  ?scroll_id <json name="_scroll_id"> : string option;
+  ?error : error option;
+  ?hits : 'a hits option;
+  ?shards <json name="_shards"> : shards_stats option;
+}
+
+type ('a) scroll_hits = 'a hit scroll_hits_generic
+
+type continue_scroll = {
+  scroll : string;
+  scroll_id : string;
+}
+
+type clear_scroll = {
+  scroll_id : string list;
+}
+
+type script = {
+  ?id : string option;
+  ?inline : string option;
+  ~params : (string * safe_json) list <json repr="object">;
+  ?lang : string option;
+}
+
+type ('a, 'b) update = {
+  ?doc : 'a option;
+  ?script : script option;
+  ?upsert : 'b option;
+  ~doc_as_upsert : bool;
+}
+
+type json_update = (safe_json, safe_json) update
+
+type json_scroll = basic_json hit scroll_hits_generic
+
+type aliases_item = {
+  ~aliases : (string * safe_json) list <json repr="object">
+}
+
+type aliases_result = (string * aliases_item) list <json repr="object">
+
+type index_template = {
+  index_patterns : string list;
+  settings : safe_json;
+  mappings : (string * index_type_mapping) list <json repr="object">;
+  order : int;
+}
+
+type index_type_mapping_meta = {
+  ?fields_default_optional : bool option;
+  ~ignore : bool;
+  ~multi : bool;
+  ?optional : bool option;
+  ?type_override : index_type_mapping_field_type option;
+  ?type_repr <json name="repr"> : [ Int64 <json name="int64"> ] option;
+}
+
+type index_type_mapping_param_dynamic = safe_json wrap <ocaml module="Wrap.IndexTypeMappingParamDynamic">
+
+type index_type_mapping_base = {
+  ~dynamic <ocaml default="`True"> : index_type_mapping_param_dynamic;
+  ?routing <json name="_routing"> : index_type_mapping_routing option;
+  ?source <json name="_source"> : index_type_mapping_source option;
+}
+
+type index_type_mapping = {
+  inherit index_type_mapping_base;
+  properties : (string * index_type_mapping_field) list <json repr="object">;
+}
+
+type index_type_mapping_annotated = {
+  inherit index_type_mapping_base;
+  ?meta <json name="_meta"> : index_type_mapping_meta option;
+  properties : (string * index_type_mapping_field_annotated) list <json repr="object">;
+}
+
+type index_type_mapping_routing = {
+  ~required : bool;
+}
+
+type index_type_mapping_source = {
+  ~excludes : string list;
+}
+
+type index_type_mapping_field_base = {
+  ~type_ <json name="type"> <ocaml default="`Object"> : index_type_mapping_field_type;
+  ?analyzer : string option;
+  ?dynamic : bool option;
+  ?eager_global_ordinals : bool option;
+  ~enabled <ocaml default="true"> : bool;
+  ?fielddata : bool option;
+  ?format : string option;
+  ?ignore_above : int option;
+  ~index <ocaml default="true"> : bool;
+  ?search_analyzer : string option;
+  ~store : bool;
+  ?term_vector : index_type_mapping_field_text_term_vector option;
+}
+
+type index_type_mapping_field = {
+  inherit index_type_mapping_field_base;
+  ~fields : (string * index_type_mapping_field) list <json repr="object">;
+  ~properties : (string * index_type_mapping_field) list <json repr="object">;
+}
+
+type index_type_mapping_field_annotated = {
+  inherit index_type_mapping_field_base;
+  ?meta <json name="_meta"> : index_type_mapping_meta option;
+  ~fields : (string * index_type_mapping_field_annotated) list <json repr="object">;
+  ~properties : (string * index_type_mapping_field_annotated) list <json repr="object">;
+}
+
+type index_type_mapping_field_type = [
+  | Bool <json name="boolean">
+  | Byte <json name="byte">
+  | Short <json name="short">
+  | Int <json name="integer">
+  | Long <json name="long">
+  | Float <json name="float">
+  | HalfFloat <json name="half_float">
+  | ScaledFloat <json name="scaled_float">
+  | Double <json name="double">
+  | Date <json name="date">
+  | IP <json name="ip">
+  | IntRange <json name="integer_range">
+  | LongRange <json name="long_range">
+  | FloatRange <json name="float_range">
+  | DoubleRange <json name="double_range">
+  | DateRange <json name="date_range">
+  | IPRange <json name="ip_range">
+  | Keyword <json name="keyword">
+  | Text <json name="text">
+  | Binary <json name="binary">
+  | GeoPoint <json name="geo_point">
+  | GeoShape <json name="geo_shape">
+  | Murmur3 <json name="murmur3">
+  | TokenCount <json name="token_count">
+  | Object <json name="object">
+  | Nested <json name="nested">
+  | Percolator <json name="percolator">
+  | Join <json name="join">
+]
+
+type index_type_mapping_field_text_term_vector = [
+  | WithPositionsOffsets <json name="with_positions_offsets">
+]

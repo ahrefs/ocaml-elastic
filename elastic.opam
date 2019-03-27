@@ -1,0 +1,18 @@
+opam-version: "2.0"
+name: "elastic"
+version: "0.1"
+synopsis: "Elasticsearch http client library"
+description: """
+Provide wrapper around most of elasticsearch http client interface
+"""
+maintainer: "Ahrefs Pte Ltd <github@ahrefs.com>"
+authors: "Ahrefs Pte Ltd <github@ahrefs.com>"
+homepage: "https://github.com/ahrefs/elastic"
+bug-reports: "https://github.com/ahrefs/elastic/issues"
+dev-repo: "git+https://github.com/ahrefs/elastic"
+depends: ["atdgen" "devkit" "farmhash" "murmur3" "lwt" "yojson" "uutf" "ounit"]
+license: "LGPL-2"
+build: [
+  ["dune" "subst"] {pinned}
+  ["dune" "build" "-p" name "-j" jobs]
+]

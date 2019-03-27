@@ -1,0 +1,11 @@
+(library
+  (name        elastic)
+  (public_name elastic)
+  (libraries atdgen devkit farmhash murmur3 lwt yojson uutf oUnit)
+  (preprocess (pps lwt_ppx))
+  )
+
+(rule
+  (targets elastic_t.mli elastic_t.ml elastic_j.mli elastic_j.ml elastic_v.ml elastic_v.mli)
+  (deps elastic.atd)
+  (action (progn (run %{bin:atdgen} -j -j-std %{deps}) (run %{bin:atdgen} -v %{deps}) (run %{bin:atdgen} -t %{deps}))))
