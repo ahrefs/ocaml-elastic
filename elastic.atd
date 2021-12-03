@@ -2,9 +2,8 @@ type basic_json <ocaml module="Atd_util.Yojson.Basic" t="t"> = abstract
 
 type safe_json <ocaml module="Atd_util.Yojson.Safe" t="t"> = abstract
 
-type unit_hit = {
+type base_hit = {
   index <json name="_index"> : string;
-  typ <json name="_type"> : string;
   id <json name="_id"> : string;
   ~routing <json name="_routing"> : string nullable;
   ~found: bool;
@@ -14,6 +13,13 @@ type unit_hit = {
   ?shard <json name="_shard"> : string option;
   ?node <json name="_node"> : string option;
   ~sort : safe_json list;
+  ?primary_term <json name="_primary_term">: int option;
+  ?seq_no <json name="_seq_no">: int option;
+}
+
+type unit_hit = {
+  inherit base_hit;
+  typ <json name="_type"> : string;
 }
 
 type nested_field = {
@@ -39,9 +45,11 @@ type ('a) hit = {
   source <json name="_source"> : 'a;
 }
 
+type total = basic_json wrap <ocaml module="Wrap.Total">
+
 (* type of the "hits" object (second level json data returned by ES) *)
 type 'a hits' = {
-  total : int;
+  total : total;
   ~max_score : float;
   hits : 'a; (* need to derive scroll_hit with concrete type for hits *)
 }
@@ -49,7 +57,8 @@ type 'a hits' = {
 type 'a hits = 'a list hits'
 
 type 'a option_hit = {
-  inherit unit_hit;
+  inherit base_hit;
+  ?typ <json name="_type"> : string nullable;
   ?source <json name="_source"> : 'a option;
 }
 
@@ -57,7 +66,7 @@ type multiget_item = {
   id <json name="_id"> : string;
   ?typ <json name="_type"> : string option;
   ?index <json name="_index"> : string option;
-  ?routing <json name="_routing"> : string option;
+  ?routing <json name="routing"> : string option;
 }
 
 (* type of ES multiget query *)
@@ -127,7 +136,7 @@ type doc_count = {
 
 type index = {
   index <json name="_index"> : string;
-  doc_type <json name="_type"> : string;
+  ?doc_type <json name="_type"> : string option;
   ?id <json name="_id"> : string option;
   ?routing : string option;
   ?version_type <json name="_version_type">: string option;
@@ -152,7 +161,7 @@ type global_error_data = {
 
 type bulk_index_result = {
   index <json name="_index"> : string;
-  doc_type <json name="_type"> : string;
+  ?doc_type <json name="_type"> : string option;
   id <json name="_id"> : string;
   ?version <json name="_version"> : int option;
   status : int;
@@ -195,7 +204,7 @@ type stats = {
 
 type index_result = {
   index <json name="_index"> : string;
-  doc_type <json name="_type"> : string;
+  ?doc_type <json name="_type"> : string option;
   id <json name="_id"> : string;
   ?version <json name="_version"> : int option;
   result : string;
@@ -233,7 +242,7 @@ type ('a) scroll_hits_generic = {
   ?error : error option;
   ?hits : 'a hits option;
   ?shards <json name="_shards"> : shards_stats option;
-}
+  }
 
 type ('a) scroll_hits = 'a hit scroll_hits_generic
 
@@ -272,19 +281,24 @@ type aliases_result = (string * aliases_item) list <json repr="object">
 
 type index_template = {
   index_patterns : string list;
-  settings : safe_json;
-  mappings : (string * index_type_mapping) list <json repr="object">;
+  settings : index_settings';
+  mappings : index_type_mapping;
   order : int;
+  aliases : (string * safe_json) list <json repr="object">;
 }
 
 type index_type_mapping_meta = {
   ?fields_default_optional : bool option;
   ~ignore : bool;
+  ~list <ocaml default="`False"> : index_type_mapping_meta_list;
   ~multi : bool;
   ?optional : bool option;
   ?type_override : index_type_mapping_field_type option;
   ?type_repr <json name="repr"> : [ Int64 <json name="int64"> ] option;
+  ?doc : string option;
 }
+
+type index_type_mapping_meta_list = basic_json wrap <ocaml module="Wrap.IndexTypeMappingMetaList">
 
 type index_type_mapping_param_dynamic = safe_json wrap <ocaml module="Wrap.IndexTypeMappingParamDynamic">
 
@@ -375,3 +389,117 @@ type index_type_mapping_field_type = [
 type index_type_mapping_field_text_term_vector = [
   | WithPositionsOffsets <json name="with_positions_offsets">
 ]
+
+type limit =
+  {
+    limit : int;
+  }
+
+type index_setting_mapping =
+  {
+    ?total_fields : limit option;
+    ?depth : limit option;
+    ?nested_fields : limit option;
+    ?nested_objects : limit option;
+    ?field_name_length : limit option;
+    ?ignore_malformed : bool option;
+    ?coerce : bool option;
+  }
+
+type index_settings_shard =
+  {
+    ?check_on_startup : string option;
+  }
+
+type index_settings_blocks =
+  {
+    ?read_only : bool option;
+    ?read_only_allow_delete : bool option;
+    ?read : bool option;
+    ?write : bool option;
+    ?metadata : bool option;
+  }
+
+type index_settings_highlight =
+  {
+    ?max_analyzed_offset : int option;
+  }
+
+type allocation_mode =
+  [
+  | All <json name="all"> (* Allows shard allocation for all shards. (default) *)
+  | Primaries <json name="primaries"> (* Allows shard allocation only for primary shards. *)
+  | New_primaries <json name="new_primaries"> (* Allows shard allocation only for newly-created primary shards. *)
+  | No_allocation <json name="none"> (* No shard allocation is allowed. *)
+  ] <ocaml repr="classic">
+
+type allocation_settings =
+  {
+    ?enable : allocation_mode option;
+    ?total_shards_per_node : int option;
+  }
+
+type rebalance_mode =
+  [
+  | All <json name="all"> (* Allows shard rebalancing for all shards. (default) *)
+  | Primaries <json name="primaries"> (* Allows shard rebalancing only for primary shards. *)
+  | Replica <json name="replicas"> (* Allows shard rebalancing only for replica shards. *)
+  | No_rebalance <json name="none"> (* No shard rebalancing is allowed. *)
+  ] <ocaml repr="classic">
+
+type rebalance_settings =
+  {
+    ?enable : rebalance_mode option;
+  }
+
+type index_settings_routing =
+  {
+    ?allocation : allocation_settings option;
+    ?rebalance : rebalance_settings option;
+  }
+
+type index_settings'' =
+  {
+    number_of_shards : int;
+    ?shard: index_settings_shard option;
+    ?codec : string option;
+    ~routing_partition_size <ocaml default="1"> : int;
+    ~number_of_replicas <ocaml default="1"> : int;
+    ?auto_expand_replicas : string option;
+    ?refresh_interval : string option;
+    ?max_result_window : int option;
+    ?max_inner_result_window : int option;
+    ?max_rescore_window : int option;
+    ?max_docvalue_fields_search : int option;
+    ?max_script_fields : int option;
+    ?max_ngram_diff : int option;
+    ?max_shingle_diff : int option;
+    ?blocks : index_settings_blocks option;
+    ?max_refresh_listeners : int option;
+    ?highlight : index_settings_highlight option;
+    ?max_terms_count : int option;
+    ?routing : index_settings_routing option;
+    ?gc_deletes : string option;
+    ?max_regex_length : int option;
+    ?default_pipeline : string option;
+    ~analysis <ocaml default="[]">: (string * basic_json) list <json repr="object">;
+    ?mapping : index_setting_mapping option;
+  }
+
+type index_settings' = { index : index_settings'' }
+
+type index_settings =
+  {
+    settings : index_settings';
+  }
+
+type index_settings_result = (string * index_settings) list <json repr="object">
+
+type sort_order = [
+  | Asc <json name="asc">
+  | Desc <json name="desc">
+]
+
+type sort_field = (string * sort_order) list <json repr="object">
+
+type sort = sort_field list

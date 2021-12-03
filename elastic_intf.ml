@@ -14,6 +14,13 @@ module type Hosts = sig
   val random_host : state -> string
 end
 
+(** Host selection with mutable internal state *)
+module type Mutable_hosts = sig
+  val hosts : string array ref
+
+  include Hosts
+end
+
 module type Host_array = sig
   val hosts : string array
 end
@@ -27,7 +34,18 @@ type 'doc any_action =
   | `Delete
   ]
 
+type lazy_action = string Lazy.t any_action
+
 type action = string any_action
+
+type seq_no_primary_term = {
+  seq_no : int;
+  primary_term : int;
+}
+
+type version_constraints =
+  | Version of int
+  | Seq_no_primary_term of seq_no_primary_term
 
 type version =
   [ `Auto
@@ -37,7 +55,7 @@ type version =
   ]
 
 type 'a bulk_action = {
-  action : action;
+  action : lazy_action;
   meta : Elastic_j.index;
   tag : 'a;
 }
@@ -46,10 +64,14 @@ type action_key_mode =
   | Full
   | IgnoreIndexName
 
-(** Args are (index, doc_type, id, routing, action). *)
-type command = string * string * string option * string option * action
-
-type command_full = string * string * string option * string option * version * action
+type command = {
+  index : string;
+  doc_type : string option;
+  id : string option;
+  routing : string option;
+  version : version option;
+  action : action;
+}
 
 type get_host = unit -> string
 
@@ -70,20 +92,21 @@ module type Query = sig
 
   exception ESError of int * string
 
-  val aliases : ?retries:int -> ?timeout:int -> ?index:string -> unit -> string option t
+  val aliases : ?retries:int -> ?timeout:int -> ?setup:(Curl.t -> unit) -> ?index:string -> unit -> string option t
 
-  val docs_stats : ?retries:int -> ?timeout:int -> string -> string option t
+  val docs_stats : ?retries:int -> ?timeout:int -> ?setup:(Curl.t -> unit) -> string -> string option t
 
-  val refresh : ?retries:int -> ?timeout:int -> string list -> unit t
+  val refresh : ?retries:int -> ?timeout:int -> ?setup:(Curl.t -> unit) -> string list -> unit t
 
   val search
     :  ?pdebug:(string -> unit) ->
     index:string ->
-    kind:string ->
+    ?kind:string ->
     ?verbose:bool ->
     ?should_exit:(unit -> unit t) ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Elastic_query_dsl.top_query ->
@@ -96,6 +119,7 @@ module type Query = sig
     ?should_exit:(unit -> unit t) ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Elastic_query_dsl.top_query ->
@@ -107,10 +131,23 @@ module type Query = sig
     ?should_exit:(unit -> unit t) ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     unit ->
     Elastic_j.search_shards option t
+
+  val get_index_settings
+    :  index:string ->
+    ?verbose:bool ->
+    ?should_exit:(unit -> unit t) ->
+    ?once:bool ->
+    ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
+    ?retries:int ->
+    ?args:(string * string) list ->
+    unit ->
+    Elastic_j.index_settings_result option t
 
   val put_string
     :  ?should_exit:(unit -> unit t) ->
@@ -120,6 +157,7 @@ module type Query = sig
     ?id:string ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     string ->
@@ -132,6 +170,7 @@ module type Query = sig
     ?id:string ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Yojson.Basic.t ->
@@ -142,9 +181,10 @@ module type Query = sig
     index:string ->
     kind:string ->
     id:string ->
-    version:int ->
+    version:version_constraints ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Yojson.Basic.t ->
@@ -157,6 +197,7 @@ module type Query = sig
     id:string ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     unit ->
@@ -170,6 +211,7 @@ module type Query = sig
     id:string ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Yojson.Basic.t ->
@@ -182,6 +224,7 @@ module type Query = sig
     id:string ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     string ->
@@ -193,9 +236,10 @@ module type Query = sig
     index:string ->
     kind:string ->
     id:string ->
-    version:int ->
+    version:version_constraints ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Yojson.Basic.t ->
@@ -208,6 +252,7 @@ module type Query = sig
     ?verbose:bool ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     string ->
@@ -220,6 +265,7 @@ module type Query = sig
     ?verbose:bool ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     string ->
@@ -232,6 +278,7 @@ module type Query = sig
     ?verbose:bool ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     Elastic_j.multiget_item list ->
@@ -239,11 +286,12 @@ module type Query = sig
 
   val multiget_ids
     :  index:string ->
-    kind:string ->
+    ?kind:string ->
     ?should_exit:(unit -> unit t) ->
     ?verbose:bool ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?args:(string * string) list ->
     string list ->
@@ -272,9 +320,10 @@ module type Query = sig
     ?verbose:bool ->
     ?once:bool ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?retries:int ->
     ?body:string ->
-    ?request_id:string ->
+    ?headers:(string * string) list ->
     Web.http_action ->
     string list ->
     ?args:(string * string) list ->
@@ -297,6 +346,7 @@ module type Query = sig
     ?action_key_mode:action_key_mode ->
     ?connecttimeout:Time.t ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?args:(string * string) list ->
     ?retry:int ->
     ?check_conflict:bool ->
@@ -323,6 +373,13 @@ module type Scroller = sig
     | Stop
     | Restart
 
+  type retry = {
+    max_delay : Time.t;
+    max_retries : int option;
+  }
+
+  val default_retry : retry
+
   type process_batch = int option * t list -> process_batch_result Lwt.t
 
   exception Wrapped of exn
@@ -335,11 +392,13 @@ module type Scroller = sig
     ?name:string ->
     ?verbose:bool ->
     ?timeout:float ->
+    ?setup:(Curl.t -> unit) ->
     ?size:int ->
     ?limit:int ->
     ?ranges:(string * int list) list ->
     index:string ->
     ?kind:string ->
+    ?on_scroll_failed:retry ->
     make_query:(unit -> Elastic_query_dsl.top_query) ->
     process_batch ->
     unit Lwt.t
@@ -353,11 +412,13 @@ module type Scroller = sig
     ?args:(string * string) list ->
     ?preference:string list ->
     ?timeout:float ->
+    ?setup:(Curl.t -> unit) ->
     ?size:int ->
     ?limit:int ->
     ?ranges:(string * int list) list ->
     index:string ->
     ?kind:string ->
+    ?on_scroll_failed:retry ->
     make_query:(unit -> Elastic_query_dsl.top_query) ->
     (t -> unit Lwt.t) ->
     unit Lwt.t
@@ -371,11 +432,13 @@ module type Scroller = sig
     ?args:(string * string) list ->
     ?preference:string list ->
     ?timeout:float ->
+    ?setup:(Curl.t -> unit) ->
     ?size:int ->
     ?limit:int ->
     ?ranges:(string * int list) list ->
     index:string ->
     ?kind:string ->
+    ?on_scroll_failed:retry ->
     query:Elastic_query_dsl.top_query ->
     (t -> unit Lwt.t) ->
     unit Lwt.t
@@ -390,11 +453,13 @@ module type Scroller = sig
     ?queue_size:int ->
     ?batch_size:int ->
     ?timeout:float ->
+    ?setup:(Curl.t -> unit) ->
     ?size:int ->
     ?limit:int ->
     ?ranges:(string * int list) list ->
     index:string ->
     ?kind:string ->
+    ?on_scroll_failed:retry ->
     query:Elastic_query_dsl.top_query ->
     (t list -> unit Lwt.t) ->
     unit Lwt.t

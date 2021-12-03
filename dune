@@ -1,7 +1,7 @@
 (library
   (name        elastic)
   (public_name elastic)
-  (libraries atdgen devkit farmhash murmur3 lwt yojson uutf oUnit)
+  (libraries ahrefskit atdgen atdgen-runtime biniou extlib curl devkit devkit.core farmhash integers murmur3 lwt lwt.unix yojson uutf ounit2)
   (preprocess (pps lwt_ppx))
   )
 

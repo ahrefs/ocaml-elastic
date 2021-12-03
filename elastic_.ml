@@ -5,6 +5,22 @@ module CC = Cache.Count
 
 let log = Log.from "elastic"
 
+let rest_total_hits_as_int = "rest_total_hits_as_int"
+
+let es7_compat_args' = rest_total_hits_as_int, "true"
+
+let es7_compat_args = [ es7_compat_args' ]
+
+let default_doc_type = "_doc"
+
+let default_kind kind = Option.default default_doc_type kind
+
+(** ES limit for text fields *)
+let elasticsearch_text_limit = 32766
+
+(** ES limit for HTTP content length is 104857600 *)
+let elasticsearch_http_limit = 16_777_216
+
 include Elastic_intf
 
 (** Host selection *)
@@ -21,7 +37,7 @@ module Make_host (A : Host_array) : Hosts = struct
     | hosts -> Action.array_random_exn hosts
 end
 
-module Make_mutable_host (A : Host_array) = struct
+module Make_mutable_host (A : Host_array) : Mutable_hosts = struct
   type state = unit
 
   let hosts = ref A.hosts
@@ -35,14 +51,18 @@ module Make_mutable_host (A : Host_array) = struct
 end
 
 module T = struct
+  (** field attributes for esgg *)
   type attr =
-    [ `Multi
-    | `Optional
-    | `NotOptional
-    | `Ignore
-    | `FieldsDefaultOptional
-    | `TypeOverride of Elastic_t.index_type_mapping_field_type
+    [ `List  (** field is a list *)
+    | `ListSometimes  (** field is a list or a scalar value *)
+    | `Multi [@deprecated "please use `List instead"]  (** field is a list *)
+    | `Optional  (** field is optional *)
+    | `NotOptional  (** field is not optional (overrides FieldsDefaultOptional on parent object) *)
+    | `Ignore  (** field should be ignored *)
+    | `FieldsDefaultOptional  (** object or nested fields are optional *)
+    | `TypeOverride of Elastic_t.index_type_mapping_field_type  (** use the specified type instead of the ES type *)
     | `TypeRepr of [ `Int64 ]
+      (** use the specified type representation instead of the default (<ocaml repr="type"> in atd) *)
     ]
 
   type field = {
@@ -63,27 +83,29 @@ module T = struct
       {
         fields_default_optional = None;
         ignore = false;
+        list = `False;
         multi = false;
         optional = None;
         type_override = None;
         type_repr = None;
+        doc = None;
       }
 
   let meta_of_attrs = function
     | None -> default_meta
     | Some attrs ->
       List.fold_left
-        begin
-          fun meta attr ->
+        (fun meta attr ->
           match attr with
-          | `Multi -> { meta with Elastic_t.multi = true }
+          | `Multi | `List -> { meta with Elastic_t.list = `True; multi = true }
+          | `ListSometimes -> { meta with Elastic_t.list = `Sometimes }
           | `Optional -> { meta with Elastic_t.optional = Some true }
           | `NotOptional -> { meta with Elastic_t.optional = Some false }
           | `Ignore -> { meta with Elastic_t.ignore = true }
           | `FieldsDefaultOptional -> { meta with Elastic_t.fields_default_optional = Some true }
           | `TypeOverride override -> { meta with Elastic_t.type_override = Some override }
           | `TypeRepr repr -> { meta with Elastic_t.type_repr = Some repr }
-        end
+        )
         default_meta attrs
 
   let rec remap fields =
@@ -107,13 +129,15 @@ module T = struct
     { meta; mapping = { Elastic_t.dynamic; routing; source }; properties = remap properties }
 
   let field type_ ?analyzer ?dynamic ?eager_global_ordinals ?enabled ?fielddata ?(fields = []) ?format ?ignore_above
-    ?index ?(properties = []) ?search_analyzer ?store ?term_vector ?(attrs : attr list option) ()
+    ?index ?(properties = []) ?search_analyzer ?store ?term_vector ?(attrs : attr list option) ?doc ()
     =
     let field =
       Elastic_v.create_index_type_mapping_field_base ~type_ ?analyzer ?dynamic ?eager_global_ordinals ?enabled
         ?fielddata ?format ?ignore_above ?index ?search_analyzer ?store ?term_vector ()
     in
-    { meta = meta_of_attrs attrs; field; fields; properties }
+    let meta = meta_of_attrs attrs in
+    let meta = { meta with doc } in
+    { meta; field; fields; properties }
 
   let rec to_index_type_mapping_field (name, { meta = _; field; fields; properties }) =
     let ({
@@ -208,38 +232,44 @@ module T = struct
     let properties = List.map to_index_type_mapping_field_annot properties in
     { Elastic_t.meta; dynamic; routing; source; properties }
 
-  let int ?attrs name = name, field `Long ?attrs ()
+  let int ?doc ?attrs name = name, field `Long ?doc ?attrs ()
 
-  let bool ?attrs name = name, field `Bool ?attrs ()
+  let bool ?doc ?attrs name = name, field `Bool ?doc ?attrs ()
 
-  let float ?attrs name = name, field `Double ?attrs ()
+  let float_single ?doc ?attrs name = name, field `Float ?doc ?attrs ()
 
-  let date ?attrs name = name, field `Date ?attrs ~format:"epoch_millis||date_optional_time" ()
+  let float ?doc ?attrs name = name, field `Double ?doc ?attrs ()
 
-  let strict_date ?attrs name = name, field `Date ?attrs ~format:"epoch_millis||strict_date_optional_time" ()
+  let date ?doc ?attrs name = name, field `Date ?doc ?attrs ~format:"epoch_millis||date_optional_time" ()
 
-  let ip ?attrs name = name, field `IP ?attrs ()
+  let strict_date ?doc ?attrs name = name, field `Date ?doc ?attrs ~format:"epoch_millis||strict_date_optional_time" ()
+
+  (* Only here for retro-compatibility, for index created with previously broken format *)
+  let old_broken_date ?doc ?attrs name = name, field `Date ?doc ?attrs ~format:"epoch_millis||dateOptionalTime" ()
+
+  let ip ?doc ?attrs name = name, field `IP ?doc ?attrs ()
 
   let searchable' = field `Text ~term_vector:`WithPositionsOffsets
 
-  let searchable ?attrs name = name, searchable' ?attrs ()
+  let searchable ?doc ?attrs name = name, searchable' ?doc ?attrs ()
 
   let keyword' = field `Keyword
 
-  let keyword ?attrs ?fields name = name, keyword' ?attrs ?fields ()
+  let keyword ?doc ?attrs ?fields name = name, keyword' ?doc ?attrs ?fields ()
 
-  let text ?attrs ?term_vector ~analyzer name = name, field `Text ?attrs ?term_vector ~analyzer ()
+  let text ?doc ?attrs ?fields ?term_vector ?fielddata ~analyzer name =
+    name, field `Text ?doc ?attrs ?fields ?term_vector ?fielddata ~analyzer ()
 
-  let text2 ?attrs ?term_vector ~index_analyzer ~search_analyzer name =
-    name, field `Text ?attrs ?term_vector ~analyzer:index_analyzer ~search_analyzer ()
+  let text2 ?doc ?attrs ?term_vector ?fielddata ~index_analyzer ~search_analyzer name =
+    name, field `Text ?doc ?attrs ?term_vector ?fielddata ~analyzer:index_analyzer ~search_analyzer ()
 
   let murmur3 ?attrs name = name, field `Murmur3 ?attrs ()
 
-  let object_ ?attrs ?dynamic name properties = name, field `Object ?attrs ?dynamic ~properties ()
+  let object_ ?doc ?attrs ?dynamic name properties = name, field `Object ?doc ?attrs ?dynamic ~properties ()
 
-  let nested ?attrs name properties = name, field `Nested ?attrs ~properties ()
+  let nested ?doc ?attrs name properties = name, field `Nested ?doc ?attrs ~properties ()
 
-  let disabled ?attrs name = name, field `Object ?attrs ~enabled:false ()
+  let disabled ?doc ?attrs name = name, field `Object ?doc ?attrs ~enabled:false ()
 
   let hashed hash (name, (t : field)) = name, { t with fields = hash "hash" :: t.fields }
 
@@ -270,7 +300,7 @@ let process_bulk_result ?(name = "") ?(check_conflict = false) ~t ?(stats = fals
   try
     let counts = CC.create () in
     let call f index doc_type id operation status =
-      if log#level = `Debug then log#debug "%s/%s/%s %s status %d" index doc_type id operation status;
+      if log#level = `Debug then log#debug "%s/%s/%s %s status %d" index (default_kind doc_type) id operation status;
       match f with
       | None -> ()
       | Some f -> f index doc_type id operation
@@ -293,7 +323,7 @@ let process_bulk_result ?(name = "") ?(check_conflict = false) ~t ?(stats = fals
           incr err_ctr;
           if status = 429 then incr ovr_ctr;
           CC.add counts (operation ^ "_fail");
-          log#warn "%s/%s/%s %s status %d [%s]: %s" index doc_type id operation status error
+          log#warn "%s/%s/%s %s status %d [%s]: %s" index (default_kind doc_type) id operation status error
             (Option.default "null" reason);
           ( match f_fail with
           | None -> None
@@ -327,7 +357,9 @@ type scroll_cb = scroll:scroll -> close:close -> string -> unit Lwt.t
     [index]:[kind], and returns results via [cb]. See {!scroll_cb} doc
     for more info.
     NB: in general _do not_ sort while scrolling *)
-let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?limit ?(scan = true) ?size ?(args = []) f =
+let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?setup ?limit ?(scan = true) ?size
+  ?(args = []) f
+  =
   let module Hosts = (val hosts : Hosts) in
   let limit =
     match limit with
@@ -354,7 +386,9 @@ let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?li
       let url = sprintf "http://%s/_search/scroll" host in
       let%lwt ok =
         let body = `Raw ("application/json", Elastic_j.(string_of_clear_scroll { scroll_id = [ scroll_id ] })) in
-        match%lwt Web.http_request_lwt' ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ~body `DELETE url with
+        match%lwt
+          Web.http_request_lwt' ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ?setup ~body `DELETE url
+        with
         | `Ok (200, _) -> Lwt.return true
         | `Ok ((404 as code), s) ->
           log_es_error host "close context gone" code s;
@@ -378,6 +412,19 @@ let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?li
         close state (Hosts.random_host state) ~retry:(retry - 1) (Some scroll_id)
       )
   in
+  let scroll_args =
+    (* rest_total_hits_as_int should be passed on every call if it was provided initially *)
+    match
+      List.find_map_exn
+        (function
+          | (k, _) as args when k = rest_total_hits_as_int -> Some args
+          | _ -> None
+          )
+        args
+    with
+    | args -> "?" ^ Web.make_url_args [ args ]
+    | exception Not_found -> ""
+  in
   let rec scroll state host ?(timeout = timeout) ?count id =
     match Daemon.should_exit () with
     | true ->
@@ -394,11 +441,13 @@ let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?li
       log#info "scroll_lwt done";
       Lwt.return_unit
     | Some scroll_id ->
-      let url = sprintf "http://%s/_search/scroll" host in
+      let url = sprintf "http://%s/_search/scroll%s" host scroll_args in
       let body =
         `Raw ("application/json", Elastic_j.(string_of_continue_scroll { scroll = sprintf "%ds" timeout; scroll_id }))
       in
-      ( match%lwt Web.http_request_lwt' ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ~body `POST url with
+      ( match%lwt
+          Web.http_request_lwt' ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ?setup ~body `POST url
+        with
       | exception exn ->
         log#error ~exn "scroll_lwt";
         let%lwt () = close state host (Some scroll_id) in
@@ -437,8 +486,8 @@ let scroll_lwt ~hosts ?request_timeout ~index ?kind ~query ~timeout ?verbose ?li
       (Web.make_url_args args)
   in
   match%lwt
-    Web.http_query_lwt ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ~body:("application/json", query) `POST
-      url
+    Web.http_query_lwt ~ua:(Pid.show_self ()) ?timeout:request_timeout ?verbose ?setup ~body:("application/json", query)
+      `POST url
   with
   | `Ok s -> f ~scroll:(scroll state host) ~close:(close state host) s
   | `Error s -> Exn_lwt.fail "scroll_lwt %s %s" url s
@@ -463,7 +512,12 @@ module Hashed_action = struct
   let show x = sprintf "%s /%s/%s/%s" x.operation (Option.default "" x.index) x.doc_type (Option.default "" x.id)
 
   let make ~action_key_mode index doc_type ?id operation =
-    { index = (if action_key_mode = Elastic_intf.Full then Some index else None); doc_type; id; operation }
+    {
+      index = (if action_key_mode = Elastic_intf.Full then Some index else None);
+      doc_type = default_kind doc_type;
+      id;
+      operation;
+    }
 end
 
 module ActionHashtbl = Hashtbl.Make (Hashed_action)
@@ -475,7 +529,7 @@ let operation_of_action = function
   | `Update _ -> "update"
 
 let doc_of_action = function
-  | `Index doc | `Create doc | `Update doc -> Some doc
+  | `Index doc | `Create doc | `Update doc -> Some (Lazy.force doc)
   | `Delete -> None
 
 let format_command { Elastic_intf.action; meta; tag = _ } =
@@ -556,18 +610,17 @@ let make_retry_enum ?(action_key_mode = Elastic_intf.Full) ?f_success ?f_fail ?f
       | true -> ()
       | false ->
         log#warn "retry_enum success callback was not called because key does not exist: %s" (Hashed_action.show k);
-        if log#level = `Debug then begin
+        if log#level = `Debug then (
           log#debug "htbl %s" (Stre.list Prelude.id (htbl_keys htbl));
           log#debug "htbl_auto %s" (Stre.list Prelude.id (htbl_keys htbl_auto))
-        end
+        )
       )
   in
   let done_all () =
-    begin
-      match f_success with
-      | Some f -> ActionHashtbl.iter (fun _ l -> List.iter (fun (_, v) -> f v) !l) htbl_auto
-      | None -> ()
-    end;
+    ( match f_success with
+    | Some f -> ActionHashtbl.iter (fun _ l -> List.iter (fun (_, v) -> f v) !l) htbl_auto
+    | None -> ()
+    );
     ActionHashtbl.clear htbl_auto
   in
   let fail error status index doc_type id operation =
@@ -575,15 +628,14 @@ let make_retry_enum ?(action_key_mode = Elastic_intf.Full) ?f_success ?f_fail ?f
     match ActionHashtbl.find htbl k with
     | exception Not_found ->
       let k = make_key index doc_type operation in
-      begin
-        match ActionHashtbl.find htbl_auto k with
-        | exception Not_found ->
-          log#warn "retry_enum fail callback was not called because key does not exist: %s" (Hashed_action.show k)
-        | l ->
-          log#warn "retry_enum document with auto id, retrying the whole batch of %d elements" (List.length !l);
-          List.iter retry !l;
-          l := []
-      end
+      ( match ActionHashtbl.find htbl_auto k with
+      | exception Not_found ->
+        log#warn "retry_enum fail callback was not called because key does not exist: %s" (Hashed_action.show k)
+      | l ->
+        log#warn "retry_enum document with auto id, retrying the whole batch of %d elements" (List.length !l);
+        List.iter retry !l;
+        l := []
+      )
     | e ->
       ActionHashtbl.remove htbl k;
       ( match f_fail with
@@ -592,15 +644,14 @@ let make_retry_enum ?(action_key_mode = Elastic_intf.Full) ?f_success ?f_fail ?f
       )
   in
   let fail_all error status =
-    begin
-      match f_fail_all with
-      | Some f when not (f error status) ->
-        let keys = List.append (htbl_keys htbl) (htbl_keys htbl_auto) in
-        log#warn "retry_enum retry cancelled for %s" (Stre.list id keys)
-      | _ ->
-        ActionHashtbl.iter (fun _ -> retry) htbl;
-        ActionHashtbl.iter (fun _ l -> List.iter retry !l) htbl_auto
-    end;
+    ( match f_fail_all with
+    | Some f when not (f error status) ->
+      let keys = List.append (htbl_keys htbl) (htbl_keys htbl_auto) in
+      log#warn "retry_enum retry cancelled for %s" (Stre.list id keys)
+    | _ ->
+      ActionHashtbl.iter (fun _ -> retry) htbl;
+      ActionHashtbl.iter (fun _ l -> List.iter retry !l) htbl_auto
+    );
     ActionHashtbl.clear htbl;
     ActionHashtbl.clear htbl_auto
   in
@@ -613,11 +664,21 @@ let make_version version =
   | `External_gte v -> Some "external_gte", Some v
   | `External_gt v -> Some "external_gt", Some v
 
-let make_command ~tag ?routing ?parent ?(version = `Auto) ~index ~doc_type action id =
+let make_lazy_command ~tag ?routing ?parent ?(version = `Auto) ~index ~doc_type action id =
   let version_type, version = make_version version in
   { action; meta = { Elastic_j.index; doc_type; id; routing; version; version_type; parent }; tag }
 
-let unpack_command (index, doc_type, id, routing, action) = make_command ~tag:() ?routing ~index ~doc_type action id
+let lazyfy = function
+  | `Index doc -> `Index (Lazy.from_val doc)
+  | `Create doc -> `Create (Lazy.from_val doc)
+  | `Update doc -> `Update (Lazy.from_val doc)
+  | `Delete -> `Delete
+
+let make_command ~tag ?routing ?parent ?version ~index ~doc_type action id =
+  make_lazy_command ~tag ?routing ?parent ?version ~index ~doc_type (lazyfy action) id
+
+let unpack_command ({ index; doc_type; id; routing; version; action } : Elastic_intf.command) =
+  make_command ~tag:() ?routing ?version ~index ~doc_type action id
 
 let wrap_upsert ?(upsert = true) doc = `Assoc [ "doc", doc; "doc_as_upsert", `Bool upsert ]
 
@@ -638,32 +699,26 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
 
   let es_fail name host code s = es_failwith code "%s on %s : HTTP (%d) %s" name host code s
 
-  let show_request_id = function
-    | None -> ""
-    | Some id -> id ^ " "
-
-  let loop_request ?(pdebug = ignore) ?(version_conflict_handler = es_fail) ?(once = false) ~name
-    ?(should_exit = should_exit) ?timeout ?retries ?(retry_init = Time.seconds 5) ?(retry_factor = 1.3)
-    ?(retry_max = Time.seconds 60) ?request_id req
+  let loop_request ?pdebug ?(version_conflict_handler = es_fail) ?(once = false) ~name ?(should_exit = should_exit)
+    ?timeout ?retries ?(retry_init = Time.seconds 5) ?(retry_factor = 1.3) ?(retry_max = Time.seconds 60) req
     =
     let timer = new Action.timer in
     let state = H.new_request () in
-    let request_id = show_request_id request_id in
     let rec loop ~wait_retry host attempt =
-      pdebug @@ sprintf "ATTEMPT #%d\n" attempt;
+      call_me_maybe pdebug (sprintf "# ATTEMPT #%d\n" attempt);
       let retry host code error_msg =
         let elapsed = int_of_float timer#get in
         match retries, timeout, once with
-        | _, _, true -> es_failwith code "%s%s on %s : %s (elapsed %ds)" request_id name host error_msg elapsed
+        | _, _, true -> es_failwith code "%s on %s : %s (elapsed %ds)" name host error_msg elapsed
         | _, Some t, _ when elapsed >= t ->
-          es_failwith code "%s%s on %s : %s : time limit reached (elapsed %ds >= %ds, tries %d)" request_id name host
-            error_msg elapsed t attempt
+          es_failwith code "%s on %s : %s : time limit reached (elapsed %ds >= %ds, tries %d)" name host error_msg
+            elapsed t attempt
         | Some n, _, _ when attempt >= n ->
-          es_failwith code "%s%s on %s : %s : retry limit reached (elapsed %ds, tries %d >= %d)" request_id name host
-            error_msg elapsed attempt n
+          es_failwith code "%s on %s : %s : retry limit reached (elapsed %ds, tries %d >= %d)" name host error_msg
+            elapsed attempt n
         | _ ->
           let pause = wait_retry +. Random.float retry_init in
-          log#warn "%s%s on %s : %s, will retry in %s (elapsed %ds, %d attempts)" request_id name host error_msg
+          log#warn "%s on %s : %s, will retry in %s (elapsed %ds, %d attempts)" name host error_msg
             (Time.duration_str pause) elapsed attempt;
           should_exit () >>= fun () ->
           T.sleep pause >>= fun () ->
@@ -673,7 +728,7 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
       | `Ok (404, _) -> T.return None
       | `Ok (code, s) when code / 100 = 2 -> T.return @@ Some s
       | `Ok (409, s) -> version_conflict_handler name host 409 s
-      | `Ok (code, s) when code / 100 = 4 -> es_failwith code "%s%s on %s : HTTP (%d) %s" request_id name host code s
+      | `Ok (code, s) when code / 100 = 4 -> es_failwith code "%s on %s : HTTP (%d) %s" name host code s
       | `Ok (code, s) -> retry host code (sprintf "HTTP (%d) %s" code s)
       | `Error code -> retry host (-1) (sprintf "CURL (%d) %s" (Curl.errno code) (Curl.strerror code))
     in
@@ -686,8 +741,8 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
       let str = l |> List.map Web.urlencode |> String.concat "," in
       sprintf "%s/" str
 
-  let request ?(pdebug = ignore) ?version_conflict_handler ~name ?should_exit ?verbose ?once ?timeout ?retries ?body
-    ?request_id action path ?(args = []) ()
+  let request ?pdebug ?version_conflict_handler ~name ?should_exit ?verbose ?once ?timeout ?setup ?retries ?body
+    ?(headers = []) action path ?(args = []) ()
     =
     let path = List.map Web.urlencode path in
     let make_url host =
@@ -696,60 +751,87 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
         | [] -> "", ""
         | args -> "?", Web.make_url_args args
       in
-      let path = sprintf "http://%s%s%s" (String.concat "/" (host :: path)) is_args args in
-      pdebug @@ sprintf "%sREQUESTING: %s\n" (show_request_id request_id) path;
-      path
+      sprintf "http://%s%s%s" (String.concat "/" (host :: path)) is_args args
     in
     let body =
       match body with
       | None -> None
-      | Some body ->
-        pdebug @@ sprintf "BODY : %s\n" body;
-        Some (`Raw ("application/json", body))
+      | Some body -> Some (`Raw ("application/json", body))
     in
-    let headers = Option.map (fun id -> [ sprintf "X-Request-ID: %s" id ]) request_id in
+    let headers = List.map (fun (k, v) -> sprintf "%s: %s" k v) headers in
+    let pdebug_curl url =
+      match pdebug with
+      | None -> ()
+      | Some pdebug ->
+        let quote = Filename.quote in
+        let b = Buffer.create 10 in
+        bprintf b "curl";
+        if action <> `GET then bprintf b " -X%s" (Web.string_of_http_action action);
+        headers |> List.iter (fun s -> bprintf b " -H %s" (quote s));
+        bprintf b " %s" (quote url);
+        begin
+          match body with
+          | None -> ()
+          | Some (`Raw (ctype, body)) ->
+            bprintf b " -H %s" (quote @@ sprintf "Content-Type: %s" ctype);
+            bprintf b " -d %s" (quote body)
+        end;
+        pdebug @@ Buffer.contents b
+    in
     let do_request host =
-      Http.http_request' ~ua:(Pid.show_self ()) ?headers ?timeout ?verbose ?body action (make_url host)
+      let url = make_url host in
+      pdebug_curl url;
+      Http.http_request' ~ua:(Pid.show_self ()) ~headers ?timeout ?verbose ?setup ?body action url
     in
-    loop_request ~pdebug ?version_conflict_handler ~name ?should_exit ?timeout ?retries ?once ?request_id do_request
+    loop_request ?pdebug ?version_conflict_handler ~name ?should_exit ?timeout ?retries ?once do_request
 
   (** [get_id ~host ~index ~kind id] returns the document of kind [kind] and id [id] from index [index].
       @return Document identified by [id] as a string *)
-  let get_id ~index ~kind ?should_exit ?verbose ?once ?timeout ?retries ?args id =
-    request ~name:"get_id" ?should_exit ?timeout ?retries ?once ?verbose `GET [ index; kind; id ] ?args ()
+  let get_id ~index ~kind ?should_exit ?verbose ?once ?timeout ?setup ?retries ?args id =
+    request ~name:"get_id" ?should_exit ?timeout ?retries ?once ?verbose ?setup `GET [ index; kind; id ] ?args ()
 
-  let get_id_kinds ~index ?(kinds = []) ?should_exit ?verbose ?once ?timeout ?retries ?args id =
-    get_id ~index ~kind:(string_of_kinds kinds) ?should_exit ?verbose ?once ?timeout ?retries ?args id
+  let get_id_kinds ~index ?(kinds = []) ?should_exit ?verbose ?once ?timeout ?setup ?retries ?args id =
+    get_id ~index ~kind:(string_of_kinds kinds) ?should_exit ?verbose ?once ?timeout ?setup ?retries ?args id
 
-  let multiget ?index ?kind ?should_exit ?verbose ?once ?timeout ?retries ?args docs =
+  let multiget ?index ?kind ?should_exit ?verbose ?once ?timeout ?setup ?retries ?args docs =
     let docs = Elastic_j.string_of_multiget { Elastic_j.docs } in
     let path = List.filter_map id [ index; kind; Some "_mget" ] in
-    request ~name:"multiget" ?should_exit ?timeout ?retries ?once ?verbose ~body:docs `GET path ?args ()
+    request ~name:"multiget" ?should_exit ?timeout ?retries ?once ?verbose ?setup ~body:docs `GET path ?args ()
 
-  let multiget_ids ~index ~kind ?should_exit ?verbose ?once ?timeout ?retries ?args ids =
+  let multiget_ids ~index ?kind ?should_exit ?verbose ?once ?timeout ?setup ?retries ?args ids =
     let ids = Yojson.Safe.to_string (`Assoc [ "ids", `List (List.map (fun x -> `String x) ids) ]) in
-    request ~name:"multiget_ids" ?should_exit ?timeout ?retries ?once ?verbose ~body:ids `GET [ index; kind; "_mget" ]
-      ?args ()
+    let path = List.filter_map id [ Some index; kind; Some "_mget" ] in
+    request ~name:"multiget_ids" ?should_exit ?timeout ?retries ?once ?verbose ?setup ~body:ids `GET path ?args ()
 
   (** [search ~index ~kind ~args query] performs a search with query
       [query] (a JSON ES query) on the ES server specified in {!host},
       on index [index] and kind [kind]. Using {!scroll_lwt} puts less
       strain of ES servers when retrieving a huge amount of data. *)
-  let search ?pdebug ~index ~kind ?verbose ?should_exit ?once ?timeout ?retries ?args query =
+  let search ?pdebug ~index ?kind ?verbose ?should_exit ?once ?timeout ?setup ?retries ?args query =
+    let path = List.filter_map id [ Some index; kind; Some "_search" ] in
     let body = Elastic_query_dsl.top_query_to_string query in
-    request ?pdebug ~name:"search" ?should_exit ?timeout ?retries ?once ?verbose ~body `POST [ index; kind; "_search" ]
+    request ?pdebug ~name:"search" ?should_exit ?timeout ?retries ?once ?verbose ?setup ~body `POST path ?args ()
+
+  let search_kinds ~index ?(kinds = []) ?verbose ?should_exit ?once ?timeout ?setup ?retries ?args query =
+    search ~index ~kind:(string_of_kinds kinds) ?verbose ?should_exit ?once ?timeout ?setup ?retries ?args query
+
+  let search_shards ~index ?verbose ?should_exit ?once ?timeout ?setup ?retries ?args () =
+    request ~name:"search_shards" ?verbose ?should_exit ?once ?timeout ?setup ?retries `GET [ index; "_search_shards" ]
       ?args ()
-
-  let search_kinds ~index ?(kinds = []) ?verbose ?should_exit ?once ?timeout ?retries ?args query =
-    search ~index ~kind:(string_of_kinds kinds) ?verbose ?should_exit ?once ?timeout ?retries ?args query
-
-  let search_shards ~index ?verbose ?should_exit ?once ?timeout ?retries ?args () =
-    request ~name:"search_shards" ?verbose ?should_exit ?once ?timeout ?retries `GET [ index; "_search_shards" ] ?args
-      ()
     >>= function
     | None -> T.return None
     | Some s ->
     match Elastic_j.search_shards_of_string s with
+    | result -> T.return (Some result)
+    | exception exn -> T.raise exn
+
+  let get_index_settings ~index ?verbose ?should_exit ?once ?timeout ?setup ?retries ?args () =
+    request ~name:"get_index_settings" ?verbose ?should_exit ?once ?timeout ?setup ?retries `GET [ index; "_settings" ]
+      ?args ()
+    >>= function
+    | None -> T.return None
+    | Some s ->
+    match Elastic_j.index_settings_result_of_string s with
     | result -> T.return (Some result)
     | exception exn -> T.raise exn
 
@@ -760,94 +842,113 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
     wait
 
   (** when [id] not specified, elastic will generate random, but [args] and [timeout] will be ignored *)
-  let put_string ?should_exit ?version_conflict_handler ~index ~kind ?id ?once ?timeout ?retries ?(args = []) body =
+  let put_string ?should_exit ?version_conflict_handler ~index ~kind ?id ?once ?timeout ?setup ?retries ?(args = [])
+    body
+    =
     let args =
       match timeout with
       | Some t -> ("timeout", sprintf "%ds" t) :: args
       | _ -> args
     in
-    let action, path, args =
+    let action, args =
       match id with
-      | None -> `POST, [ index; kind ], None
-      | Some id -> `PUT, [ index; kind; id ], Some args
+      | Some _ -> `PUT, Some args
+      | None -> `POST, None
     in
-    request ?version_conflict_handler ~name:"put" ?once ?retries ?should_exit ?timeout ~body action path ?args ()
+    let path =
+      index
+      :: kind
+      ::
+      ( match id with
+      | Some id -> [ id ]
+      | None -> []
+      )
+    in
+    request ?version_conflict_handler ~name:"put" ?once ?retries ?should_exit ?timeout ?setup ~body action path ?args ()
 
-  let put ?should_exit ~index ~kind ?id ?once ?timeout ?retries ?args body =
-    put_string ?should_exit ~index ~kind ?id ?once ?timeout ?retries ?args (J.to_string body) >>= function
+  let put ?should_exit ~index ~kind ?id ?once ?timeout ?setup ?retries ?args body =
+    put_string ?should_exit ~index ~kind ?id ?once ?timeout ?setup ?retries ?args (J.to_string body) >>= function
     | None -> T.return None
     | Some s ->
     match Elastic_j.index_result_of_string s with
     | result -> T.return (Some result)
     | exception exn -> T.raise exn
 
-  let put_versioned ?should_exit ~index ~kind ~id ~version ?once ?timeout ?retries ?(args = []) body =
-    let args = ("version", string_of_int version) :: args in
+  let make_version_args = function
+    | Version version -> [ "version", string_of_int version ]
+    | Seq_no_primary_term { seq_no; primary_term } ->
+      [ "if_seq_no", string_of_int seq_no; "if_primary_term", string_of_int primary_term ]
+
+  let put_versioned ?should_exit ~index ~kind ~id ~version ?once ?timeout ?setup ?retries ?(args = []) body =
+    let args = make_version_args version @ args in
     let body = J.to_string body in
     let version_conflict_handler _name _host _code _s = T.return None in
-    put_string ~version_conflict_handler ?should_exit ~index ~kind ~id ?once ?timeout ?retries ~args body >>= function
-    | Some _ -> T.return true
-    | None -> T.return false
-
-  let delete ?should_exit ~index ~kind ~id ?once ?timeout ?retries ?(args = []) () =
-    let args =
-      match timeout with
-      | Some t -> ("timeout", sprintf "%ds" t) :: args
-      | _ -> args
-    in
-    request ?timeout ~name:"delete" ?once ?retries ?should_exit `DELETE [ index; kind; id ] ~args () >>= fun _ ->
-    T.return ()
-
-  let update_string ?should_exit ~index ~kind ~id ?once ?timeout ?retries ?(args = []) body =
-    let args =
-      match timeout with
-      | Some t -> ("timeout", sprintf "%ds" t) :: args
-      | _ -> args
-    in
-    request ~name:"update" ?once ?retries ?should_exit ?timeout ~body `POST [ index; kind; id; "_update" ] ~args ()
-
-  let update ?should_exit ?upsert ~index ~kind ~id ?once ?timeout ?retries ?args body =
-    let body = wrap_upsert ?upsert body |> J.to_string in
-    update_string ?should_exit ~index ~kind ~id ?once ?timeout ?retries ?args body >>= fun _ -> T.return ()
-
-  let update_versioned ?should_exit ?upsert ~index ~kind ~id ~version ?once ?timeout ?retries ?(args = []) body =
-    let body = wrap_upsert ?upsert body |> J.to_string in
-    let args = ("version", string_of_int version) :: args in
-    let args =
-      match timeout with
-      | Some t -> ("timeout", sprintf "%ds" t) :: args
-      | _ -> args
-    in
-    let version_conflict_handler _name _host _code _s = T.return None in
-    request ~version_conflict_handler ~name:"update" ?once ?retries ?should_exit ?timeout ~body `POST
-      [ index; kind; id; "_update" ] ~args ()
+    put_string ~version_conflict_handler ?should_exit ~index ~kind ~id ?once ?timeout ?setup ?retries ~args body
     >>= function
     | Some _ -> T.return true
     | None -> T.return false
 
-  let refresh ?retries ?timeout indices =
+  let delete ?should_exit ~index ~kind ~id ?once ?timeout ?setup ?retries ?(args = []) () =
+    let args =
+      match timeout with
+      | Some t -> ("timeout", sprintf "%ds" t) :: args
+      | _ -> args
+    in
+    let path = [ index; kind; id ] in
+    request ?timeout ?setup ~name:"delete" ?once ?retries ?should_exit `DELETE path ~args () >>= fun _ -> T.return ()
+
+  let update_string ?should_exit ~index ~kind ~id ?once ?timeout ?setup ?retries ?(args = []) body =
+    let args =
+      match timeout with
+      | Some t -> ("timeout", sprintf "%ds" t) :: args
+      | _ -> args
+    in
+    let path = [ index; kind; id; "_update" ] in
+    request ~name:"update" ?once ?retries ?should_exit ?timeout ?setup ~body `POST path ~args ()
+
+  let update ?should_exit ?upsert ~index ~kind ~id ?once ?timeout ?setup ?retries ?args body =
+    let body = wrap_upsert ?upsert body |> J.to_string in
+    update_string ?should_exit ~index ~kind ~id ?once ?timeout ?setup ?retries ?args body >>= fun _ -> T.return ()
+
+  let update_versioned ?should_exit ?upsert ~index ~kind ~id ~version ?once ?timeout ?setup ?retries ?(args = []) body =
+    let body = wrap_upsert ?upsert body |> J.to_string in
+    let args = make_version_args version @ args in
+    let args =
+      match timeout with
+      | Some t -> ("timeout", sprintf "%ds" t) :: args
+      | _ -> args
+    in
+    let version_conflict_handler _name _host _code _s = T.return None in
+    let path = [ index; kind; id; "_update" ] in
+    request ~version_conflict_handler ~name:"update" ?once ?retries ?should_exit ?timeout ?setup ~body `POST path ~args
+      ()
+    >>= function
+    | Some _ -> T.return true
+    | None -> T.return false
+
+  let refresh ?retries ?timeout ?setup indices =
     match indices with
     | [] ->
       log#warn "no indices to refresh";
       T.return ()
     | indices ->
       let path = [ String.concat "," indices; "_refresh" ] in
-      request ~name:"refresh" ?retries ~verbose:true ?timeout `POST path () >>= fun s ->
+      request ~name:"refresh" ?retries ~verbose:true ?setup ?timeout `POST path () >>= fun s ->
       log#debug "refresh %s" (Option.default "Not found" s);
       T.return ()
 
-  let aliases ?retries ?timeout ?index () =
+  let aliases ?retries ?timeout ?setup ?index () =
     match index with
-    | None -> request ~name:"aliases" ?retries ?timeout ~verbose:true `GET [ "_aliases" ] ()
-    | Some index -> request ~name:"alias" ?retries ?timeout ~verbose:true `GET [ index; "_alias" ] ()
+    | None -> request ~name:"aliases" ?retries ?timeout ~verbose:true ?setup `GET [ "_aliases" ] ()
+    | Some index -> request ~name:"alias" ?retries ?timeout ~verbose:true ?setup `GET [ index; "_alias" ] ()
 
-  let docs_stats ?retries ?timeout index =
-    request ~name:"docs_stats" ?retries ?timeout ~verbose:true `GET [ index; "_stats"; "docs" ] ()
+  let docs_stats ?retries ?timeout ?setup index =
+    request ~name:"docs_stats" ?retries ?timeout ~verbose:true ?setup `GET [ index; "_stats"; "docs" ] ()
 
   (* FIXME limit = Limits.elasticsearch_http_limit*)
   let bulk_write_worker ?(dry_run = false) ?(name = "") ~hosts ~f_success ~f_done_all ~f_fail ~f_fail_all
-    ?connecttimeout ?(timeout = 60) ?(chunked = true) ?check_conflict ?(limit_bytes = 10_000_000) ?(args = []) ~make
-    ~mark enum
+    ?connecttimeout ?(timeout = 60) ?setup ?(chunked = false) ?check_conflict ?(limit_bytes = 10_000_000) ?(args = [])
+    ~make ~mark enum
     =
     match Enum.is_empty enum with
     | true -> T.return ()
@@ -856,42 +957,40 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
       ( match dry_run with
       | true ->
         Enum.iter
-          begin
-            fun ((_, { action; meta = { Elastic_j.index; doc_type; id; _ }; _ }) as e) ->
+          (fun ((_, { action; meta = { Elastic_j.index; doc_type; id; _ }; _ }) as e) ->
             let (_ : string) = make e in
             let () = mark e in
             let () = f_success index doc_type (Option.default "<auto>" id) (operation_of_action action) in
             ()
-          end
+          )
           enum;
         T.return ()
       | false ->
-        let read = Io_utils.chunked_read enum ~limit_bytes ~mark make in
         let content_type = "application/x-ndjson" in
         let content_type_header = "Content-Type: " ^ content_type in
+        let setup = call_me_maybe setup in
         let setup, body =
           match chunked with
           | true ->
+            let open Curl in
+            let read = Io_utils.chunked_read_lax enum ~limit_bytes ~mark make in
+            let read i =
+              let s, o, l = read i in
+              String.sub s o l
+            in
             let setup h =
-              let open Curl in
               Option.may (set_connecttimeoutms h $ Time.to_ms) connecttimeout;
               set_readfunction h read;
-              set_httpheader h [ content_type_header; "Transfer-Encoding: chunked" ]
+              set_httpheader h [ content_type_header; "Transfer-Encoding: chunked" ];
+              setup h
             in
             setup, None
           | false ->
-            let contents =
-              let buf = Buffer.create limit_bytes in
-              let rec loop () =
-                let s = read limit_bytes in
-                Buffer.add_string buf s;
-                if String.length s >= limit_bytes then loop () else Buffer.contents buf
-              in
-              loop ()
-            in
+            let contents = Io_utils.read_up_to enum ~limit_bytes ~mark make in
             let setup h =
               Option.may (Curl.set_connecttimeoutms h $ Time.to_ms) connecttimeout;
-              Curl.set_httpheader h [ content_type_header ]
+              Curl.set_httpheader h [ content_type_header ];
+              setup h
             in
             setup, Some (`Raw (content_type, contents))
         in
@@ -908,7 +1007,7 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
           T.return ()
         | `Ok (code, error) ->
           log#error "bulk_write %s to %s : http %d %s" name url code
-            (if log#level = `Debug then error else Stre.shorten 256 error);
+            (if log#level = `Debug || code = 400 then error else Stre.shorten 256 error);
           f_fail_all error code;
           T.return ()
         | `Error code ->
@@ -920,7 +1019,7 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
       )
 
   let bulk_write_wrapper ?dry_run ?(name = "") ?chunked ?limit_bytes ?stats:stats' ?f_success ?f_fail ?f_fail_all
-    ?f_retry ?f_fail_retry ?action_key_mode ?connecttimeout ?timeout ?args ?check_conflict cb
+    ?f_retry ?f_fail_retry ?action_key_mode ?connecttimeout ?timeout ?setup ?args ?check_conflict cb
     =
     if log#level = `Debug then log#debug "bulk_write %s" name;
     let verbose = log#level = `Debug in
@@ -993,7 +1092,7 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
             f error code;
             f_fail_all error code
       in
-      bulk_write_worker ?dry_run ~name ~hosts ~f_success ~f_done_all ~f_fail ~f_fail_all ?connecttimeout ?timeout
+      bulk_write_worker ?dry_run ~name ~hosts ~f_success ~f_done_all ~f_fail ~f_fail_all ?connecttimeout ?timeout ?setup
         ?chunked ?limit_bytes ?args ?check_conflict ~make ~mark enum
     in
     cb retry bulk_write >>= fun () ->
@@ -1050,6 +1149,7 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
     ?action_key_mode:action_key_mode ->
     ?connecttimeout:Time.t ->
     ?timeout:int ->
+    ?setup:(Curl.t -> unit) ->
     ?args:(string * string) list ->
     ?retry:int ->
     ?check_conflict:bool ->
@@ -1058,35 +1158,36 @@ module Query (Http : Web.HTTP) (H : Hosts) : Elastic_intf.Query with type 'a t =
     unit t
 
   let bulk_write' ?dry_run ?name ?chunked ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-    ?action_key_mode ?connecttimeout ?timeout ?args ?retry ?check_conflict ?(loop = retry_loop) enum
+    ?action_key_mode ?connecttimeout ?timeout ?setup ?args ?retry ?check_conflict ?(loop = retry_loop) enum
     =
     let enum = Enum.map (fun e -> retry, e) enum in
     bulk_write_wrapper ?dry_run ?name ?chunked ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-      ?action_key_mode ?connecttimeout ?timeout ?check_conflict ?args (loop enum)
+      ?action_key_mode ?connecttimeout ?timeout ?setup ?check_conflict ?args (loop enum)
 
   let bulk_write ?dry_run ?name ?chunked ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-    ?action_key_mode ?connecttimeout ?timeout ?args ?retry ?check_conflict ?loop enum
+    ?action_key_mode ?connecttimeout ?timeout ?setup ?args ?retry ?check_conflict ?loop enum
     =
     let enum = Enum.map unpack_command enum in
     bulk_write' ?dry_run ?name ?chunked ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-      ?action_key_mode ?connecttimeout ?timeout ?args ?retry ?check_conflict ?loop enum
+      ?action_key_mode ?connecttimeout ?timeout ?setup ?args ?retry ?check_conflict ?loop enum
 end
+
 (* Query *)
 
 module type Query_lwt_t = Elastic_intf.Query with type 'a t = 'a Lwt.t
 
 module type Query_blocking_t = Elastic_intf.Query with type 'a t = 'a
 
-let bulk_write_stream ~elastic ?dry_run ?name ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-  ?args ?action_key_mode ?retry ?loop:bulk_write_loop stream
+let bulk_write_stream ~elastic ?setup ?dry_run ?name ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry
+  ?f_fail_retry ?args ?action_key_mode ?retry ?loop:bulk_write_loop stream
   =
   let module Elastic = (val elastic : Query_lwt_t) in
   let rec continue enum =
     match Enum.is_empty enum with
     | false ->
       let%lwt () =
-        Elastic.bulk_write' ?dry_run ?name ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry ?f_fail_retry
-          ?args ?action_key_mode ?retry ?loop:bulk_write_loop enum
+        Elastic.bulk_write' ?setup ?dry_run ?name ?limit_bytes ?stats ?f_success ?f_fail ?f_fail_all ?f_retry
+          ?f_fail_retry ?args ?action_key_mode ?retry ?loop:bulk_write_loop enum
       in
       continue enum
     | true ->
@@ -1097,11 +1198,11 @@ let bulk_write_stream ~elastic ?dry_run ?name ?limit_bytes ?stats ?f_success ?f_
   and get_more () =
     let enum =
       Enum.from (fun () ->
-        match Lwt_stream.get_available stream with
+        match Lwt_stream.get_available_up_to 1 stream with
         | [] -> raise Enum.No_more_elements
-        | l -> List.enum l
+        | [ x ] -> x
+        | _ -> assert false
       )
-      |> Enum.concat
     in
     continue enum
   in
@@ -1142,13 +1243,14 @@ let _murmur3_test =
   ()
 
 let routing_shard ~nr_shards ?partition_size ?routing id =
+  let murmur3_hash x = Unsigned.UInt32.of_int (Int32.to_int (murmur3_hash x)) in
   let hash = murmur3_hash (Option.default id routing) in
   let offset =
     match partition_size with
-    | Some size when size > 1 -> unsigned_mod32 (murmur3_hash id) (Int32.of_int size)
-    | _ -> 0l
+    | Some size when size > 1 -> Unsigned.UInt32.rem (murmur3_hash id) (Unsigned.UInt32.of_int size)
+    | _ -> Unsigned.UInt32.zero
   in
-  unsigned_mod32 (Int32.add hash offset) (Int32.of_int nr_shards) |> Int32.to_int
+  Unsigned.UInt32.rem (Unsigned.UInt32.add hash offset) (Unsigned.UInt32.of_int nr_shards) |> Unsigned.UInt32.to_int
 
 let _routing_shard_test =
   let open OUnit in
@@ -1289,12 +1391,20 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
     | Stop
     | Restart
 
+  type retry = {
+    max_delay : Time.t;
+    max_retries : int option;
+  }
+
+  let default_retry = { max_delay = Time.seconds 10; max_retries = None }
+
   type process_batch = int option * S.t list -> process_batch_result Lwt.t
 
   exception Wrapped of exn
 
   let scroll_batch_lwt ~hosts ?request_timeout ?(preference = []) ?(args = []) ?(name = "scroll") ?(verbose = false)
-    ?(timeout = Time.minutes 2) ?size ?limit ?ranges ~index ?kind ~make_query (process_batch : process_batch)
+    ?(timeout = Time.minutes 2) ?setup ?size ?limit ?ranges ~index ?kind ?(on_scroll_failed = default_retry) ~make_query
+    (process_batch : process_batch)
     =
     let timeout = Time.int timeout in
     let elapsed = new Action.timer in
@@ -1320,7 +1430,7 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
     if verbose then
       log#info "%s using prefs parameter %S and argument %S" name (Web.make_url_args prefs) (Web.make_url_args args);
     let args = prefs @ args in
-    let rec loop_scroll () =
+    let rec loop_scroll attempt () =
       match make_query () with
       | exception exn ->
         log#error ~exn "%s make_query" name;
@@ -1329,7 +1439,7 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
         let query = Elastic_query_dsl.top_query_to_string query in
         log#info "%s start on indices %s with query %s" name index query;
         ( try%lwt
-            scroll_lwt ~hosts ~index ?kind ?request_timeout ~verbose:true ~query ~timeout ?size ~args
+            scroll_lwt ~hosts ~index ?kind ?request_timeout ~verbose:true ~query ~timeout ?setup ?size ~args
               (fun ~scroll ~close s ->
               tick ();
               match S.unformat s with
@@ -1358,10 +1468,11 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
                   log#info "%s end scroll" name;
                   close scroll_id
                 | { hits = Some x; _ } ->
-                  total_hits := x.total;
+                  total_hits := x.total.value;
                   let len = List.length x.hits in
                   if verbose then
-                    log#info "%s scroll got hits %d processed %d total %d limit %s" name len !processed_hits x.total
+                    log#info "%s scroll got hits %d processed %d total %a limit %s" name len !processed_hits
+                      Wrap.Total.sprint x.total
                       (Option.map_default string_of_int "NONE" limit);
                   let hits, len, continue =
                     match limit with
@@ -1383,7 +1494,7 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
                   | Stop -> close scroll_id
                   | Restart ->
                     let%lwt () = close scroll_id in
-                    loop_scroll ()
+                    loop_scroll attempt ()
                   )
                 | _ ->
                   log#info "%s end scroll" name;
@@ -1396,17 +1507,17 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
           Lwt.fail exn
         | exn ->
           log#warn ~exn "%s scroll failed" name;
-          let%lwt () = Lwt_unix.sleep 10. in
-          processed_hits := 0;
-          loop_scroll ()
+          let { max_delay; max_retries; _ } = on_scroll_failed in
+          let%lwt attempt = Retry.exp_backoff ~exn ~name ?max_retries ~max_delay attempt in
+          loop_scroll attempt ()
         )
     in
-    let%lwt () = loop_scroll () in
+    let%lwt () = loop_scroll 1 () in
     log#info "%s finished index %s" name index;
     Lwt.return_unit
 
   let scroll_stream_lwt' ~hosts ?name ?verbose ?request_timeout ?(on_shard_failure = `Continue) ?args ?preference
-    ?timeout ?size ?limit ?ranges ~index ?kind ~make_query push
+    ?timeout ?setup ?size ?limit ?ranges ~index ?kind ?on_scroll_failed ~make_query push
     =
     let process_batch (failed_shards, hits) =
       let%lwt () = Lwt_list.iter_s push hits in
@@ -1422,17 +1533,17 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
         Lwt.return Restart
       | `Fail exn -> Lwt.fail exn
     in
-    scroll_batch_lwt ~hosts ?name ?verbose ?request_timeout ?args ?preference ?timeout ?size ?limit ?ranges ~index ?kind
-      ~make_query process_batch
+    scroll_batch_lwt ~hosts ?name ?verbose ?request_timeout ?args ?preference ?timeout ?setup ?size ?limit ?ranges
+      ~index ?kind ?on_scroll_failed ~make_query process_batch
 
-  let scroll_stream_lwt ~hosts ?name ?verbose ?request_timeout ?on_shard_failure ?args ?preference ?timeout ?size ?limit
-    ?ranges ~index ?kind ~query push
+  let scroll_stream_lwt ~hosts ?name ?verbose ?request_timeout ?on_shard_failure ?args ?preference ?timeout ?setup ?size
+    ?limit ?ranges ~index ?kind ?on_scroll_failed ~query push
     =
-    scroll_stream_lwt' ~hosts ?name ?verbose ?request_timeout ?on_shard_failure ?args ?preference ?timeout ?size ?limit
-      ?ranges ~index ?kind ~make_query:(const query) push
+    scroll_stream_lwt' ~hosts ?name ?verbose ?request_timeout ?on_shard_failure ?args ?preference ?timeout ?setup ?size
+      ?limit ?ranges ~index ?kind ?on_scroll_failed ~make_query:(const query) push
 
   let scroll_worker_lwt ~hosts ?name ?(verbose = false) ?request_timeout ?on_shard_failure ?args ?(queue_size = 5000)
-    ?(batch_size = 100) ?timeout ?size ?limit ?ranges ~index ?kind ~query f
+    ?(batch_size = 100) ?timeout ?setup ?size ?limit ?ranges ~index ?kind ?on_scroll_failed ~query f
     =
     let worker_s, push = Lwt_stream.create_bounded queue_size in
     let rec worker () =
@@ -1451,8 +1562,8 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
         worker ()
     in
     let scroller () =
-      (scroll_stream_lwt ~hosts ?name ~verbose ?request_timeout ?on_shard_failure ?args ?timeout ?size ?limit ?ranges
-         ~index ?kind ~query push#push
+      (scroll_stream_lwt ~hosts ?name ~verbose ?request_timeout ?on_shard_failure ?args ?timeout ?setup ?size ?limit
+         ?ranges ~index ?kind ?on_scroll_failed ~query push#push
       )
         [%finally
           push#close;
@@ -1462,3 +1573,18 @@ module Scroller (S : Scroll_hit) : Scroller with type t = S.t = struct
     and () = scroller () in
     Lwt.return_unit
 end
+
+(** Escape the characters reserved in a query string.
+    The list is specified at
+    https://www.elastic.co/guide/en/elasticsearch/reference/6.6/query-dsl-query-string-query.html#_reserved_characters
+    ['<' '>'] can't be escaped and should be removed.
+*)
+let escape_query_string s =
+  String.replace_chars
+    (function
+      | ( '+' | '-' | '=' | '>' | '<' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~' | '*' | '?' | ':'
+        | '\\' | '/' | '&' | '|' ) as c ->
+        "\\" ^ String.of_char c
+      | c -> String.of_char c
+      )
+    s
