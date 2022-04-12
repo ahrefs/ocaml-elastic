@@ -10,7 +10,7 @@ authors: "Ahrefs Pte Ltd <github@ahrefs.com>"
 homepage: "https://github.com/ahrefs/elastic"
 bug-reports: "https://github.com/ahrefs/elastic/issues"
 dev-repo: "git+https://github.com/ahrefs/elastic"
-depends: ["atdgen" "devkit" "farmhash" "murmur3" "lwt" "yojson" "uutf" "ounit"]
+depends: ["atdgen" "devkit" "farmhash" "murmur3" "lwt" "yojson" "uutf" "ounit" "integers"]
 license: "LGPL-2"
 build: [
   ["dune" "subst"] {pinned}
